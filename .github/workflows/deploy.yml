@@ -1,26 +1,10 @@
-# CCM スリム版 v0.2 Draft 2 — デプロイ専用 GitHub Actions 下書き
-# 出典: CCM_slim_v0.2.md §2.3, §10.3, §11.4, §11.5, §13.1 / 17.0 決定済み
-# 置き場所の想定: リポジトリの .github/workflows/deploy.yml (ファイル名から .DRAFT を外す)
-# 状態: DRAFT。未検証。リポジトリ名・D1・Pages URL が決まってから有効化する。
-# D1 HTTP API の呼び出し形は 2026-11-09 に Cloudflare 公式 API ドキュメントで確認済み
-# (POST /accounts/{account_id}/d1/database/{database_id}/query, body {sql, params},
-#  応答は result[0].results にオブジェクト配列。権限は D1 Read)。
-# 残る未確認は実環境の account / database ID とトークンの権限範囲のみ。
-# 決定済み (17.0 B群):
-#   - D1 読み取りは Cloudflare HTTP API 経由 (Wrangler 必須としない)
-#   - デプロイ要求は workflow_dispatch (Muse からの要求)
-#   - 公開検証の再試行は暫定で 2分後 → 10分後 → 30分後 (キャッシュ反映の実測 約10分)
-#   - スナップショット保持は2世代 (D1 側で管理。ここでは最新リビジョンだけ読む)
-# 禁止事項 (§11.4, §18): API 由来情報を Actions ログへ出力しない。生成 JSON を Git へコミットしない。
-# 公開 JSON は Artifact から直接 Pages へデプロイする。
-
 name: Deploy CCM public JSON
 
 on:
   workflow_dispatch:
     inputs:
       revision:
-        description: "公開リビジョン (省略時は D1 の最新 verified/pending スナップショット)"
+        description: "Expected approved publication revision (blank: latest)"
         required: false
         type: string
 
@@ -31,101 +15,58 @@ permissions:
 
 concurrency:
   group: ccm-pages-deploy
-  cancel-in-progress: false # 古いリビジョンが新しいリビジョンを上書きしない (§11.4)
+  cancel-in-progress: false
 
 jobs:
   deploy:
+    # An unmerged branch/PR must not gain a publication path through dispatch.
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     env:
-      # GitHub Secrets に置くもの (§13.1)。値はここに書かない。
-      # CLOUDFLARE_ACCOUNT_ID / CLOUDFLARE_D1_DATABASE_ID / CLOUDFLARE_API_TOKEN
-      # (Actions 用トークンは D1 読み取りだけに権限を絞ること)
-      CF_API: https://api.cloudflare.com/client/v4
+      CCM_API_BASE_URL: ${{ vars.CCM_API_BASE_URL }}
+      CCM_DEPLOY_TOKEN: ${{ secrets.CCM_DEPLOY_TOKEN }}
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read latest publication snapshot from D1 (HTTP API)
-        id: snapshot
+      - name: Read and validate approved snapshot; record attempt in D1
+        id: prepare
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_D1_DATABASE_ID }}
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-        run: |
-          set -euo pipefail
-          # 最新リビジョンのスナップショット1件だけ読む。API 由来の本文をログに出さない。
-          # 呼び出し形は Cloudflare 公式 API ドキュメントで確認済み (2026-11-09)。
-          # 応答の success を確認し、result[0].results から行を取り出す。
-          python3 - <<'PY'
-          import json, os, urllib.request
-          account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-          db = os.environ["CLOUDFLARE_D1_DATABASE_ID"]
-          token = os.environ["CLOUDFLARE_API_TOKEN"]
-          url = f"https://api.cloudflare.com/client/v4/accounts/{account}/d1/database/{db}/query"
-          body = json.dumps({"sql": "SELECT revision, snapshot_json FROM publication_snapshots ORDER BY revision DESC LIMIT 1;"}).encode()
-          req = urllib.request.Request(url, data=body, headers={
-              "Authorization": f"Bearer {token}", "Content-Type": "application/json"})
-          with urllib.request.urlopen(req) as resp:
-              payload = json.load(resp)
-          assert payload.get("success"), f"D1 query failed: {payload.get('errors')}"
-          rows = payload["result"][0]["results"]
-          assert rows, "no publication snapshot in D1"
-          snap = json.loads(rows[0]["snapshot_json"])
-          # library.json / queue.json を生成する (形式は §11.1、VRChat v0.1 FIX Rev.1 準拠)
-          with open("library.json", "w", encoding="utf-8") as f:
-              json.dump({"version": 1, "movies": snap["movies"]}, f, ensure_ascii=False)
-          with open("queue.json", "w", encoding="utf-8") as f:
-              json.dump({"version": 1, "queue": snap["queue"]}, f, ensure_ascii=False)
-          print(f"revision={rows[0]['revision']}")
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
-              f.write(f"revision={rows[0]['revision']}\n")
-          PY
+          REQUESTED_REVISION: ${{ inputs.revision }}
+        run: python3 scripts/ccm_deploy.py prepare
 
-      - name: Validate public JSON (§11.5)
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          lib = json.load(open("library.json", encoding="utf-8"))
-          que = json.load(open("queue.json", encoding="utf-8"))
-          ids = [m["id"] for m in lib["movies"]]
-          assert len(ids) == len(set(ids)), "duplicate movie id"
-          qids = [q["id"] for q in que["queue"]]
-          assert len(qids) == len(set(qids)), "duplicate queue id"
-          idset = set(ids)
-          assert all(q["movieId"] in idset for q in que["queue"]), "queue references unknown movie"
-          print(f"movies={len(ids)} queue={len(qids)}")
-          PY
-
-      - name: Upload Pages artifact (keep 1 day, §11.4)
+      # P1: narrow the artifact to a dedicated public directory. Root packaging
+      # deliberately remains unchanged in Stage 1 P0; no context/secrets go here.
+      - name: Upload Pages artifact (retain one day)
+        id: artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: .
           retention-days: 1
+          include-hidden-files: false
+
+      - name: Revalidate revision immediately before deployment
+        id: authorize
+        run: python3 scripts/ccm_deploy.py authorize
 
       - name: Deploy to GitHub Pages
         id: deploy
         uses: actions/deploy-pages@v4
 
-      - name: Verify published URL (retries 2 / 10 / 30 min, §11.4 暫定)
+      - name: Verify both published URLs (2 / 10 / 30 minutes)
+        id: verify
         env:
           PAGE_URL: ${{ steps.deploy.outputs.page_url }}
-        run: |
-          set -euo pipefail
-          # デプロイ成功と公開反映済みを混同しない (§18-13)。
-          # 公開 URL の内容を実際に取得し、生成した JSON と一致を確認する。
-          for wait in 120 480 1200; do
-            sleep "$wait"
-            if curl -fsSL "$PAGE_URL/library.json" -o /tmp/published_library.json \
-               && cmp -s library.json /tmp/published_library.json \
-               && curl -fsSL "$PAGE_URL/queue.json" -o /tmp/published_queue.json \
-               && cmp -s queue.json /tmp/published_queue.json; then
-              echo "verified after ${wait}s"
-              exit 0
-            fi
-            echo "not yet reflected after ${wait}s, retrying..."
-          done
-          echo "publication verification failed" >&2
-          exit 1
+        run: python3 scripts/ccm_deploy.py verify
+
+      - name: Record exact attempt result in D1
+        if: always()
+        env:
+          ARTIFACT_OUTCOME: ${{ steps.artifact.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: python3 scripts/ccm_deploy.py finish
