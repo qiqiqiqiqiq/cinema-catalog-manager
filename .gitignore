@@ -1,0 +1,16 @@
+node_modules/
+.wrangler/
+.build/
+.dev.vars*
+.env*
+wrangler.local.jsonc
+library.json
+queue.json
+*.sqlite*
+*.db
+__pycache__/
+*.pyc
+.coverage
+coverage/
+.deploy-context*
+approval.local.json

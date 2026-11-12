@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ccm-stage1-api",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-07-01",
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "ccm-db",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "migrations"
+  }],
+  "vars": {
+    "RETENTION_DAYS": "30",
+    "DELETION_GRACE_HOURS": "72",
+    "YOUTUBE_REFRESH_DAILY_BUDGET": "8000"
+  }
+}
