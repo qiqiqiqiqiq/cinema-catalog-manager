@@ -27,6 +27,8 @@
 
 本文の検証時もAPIデータをActionsログへ書きません。ログで必要なのは試行ID、リビジョン、段階、件数、一致結果、定義済みエラーコードです。
 
+`workers.dev` ではPython標準の `urllib` のUser-AgentがCloudflare側で403になる場合があります。本スクリプトはアプリ名を明示した `CCM-Publication/0.1` を送信します。認証とリダイレクト拒否は維持しています。403だけからトークン不一致と断定せず、このヘッダーを含む通信設定を確認してください。[Cloudflareの公式説明](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/)
+
 ## 強制停止・孤立した公開ロック
 
 runnerの強制終了、通信途絶、結果保存失敗では、終了処理が動かずロックが残る場合があります。本P0のロックに自動期限切れはありません。古いrunnerが後から公開を再開する可能性があるため、時間経過だけで新しい試行へ公開権を渡しません。
