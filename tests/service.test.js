@@ -357,3 +357,93 @@ test('finish accepts only the shared fixed operational error codes and phases', 
   await service.finishDeployment('100-1', { ...failed, errorCode: 'prepare_failed', phase: 'prepare' });
   assert.equal(row(db, 'SELECT error_code FROM ccm_deployment_attempts').error_code, 'prepare_failed');
 });
+
+test('existing explicit positive-offset dates support approval, export and refresh without data normalization', async t => {
+  const { db, service } = setup(t);
+  const original = '2026-11-10T09:03:41+09:00';
+  const originalDeadline = '2026-12-10T09:03:41+09:00';
+  seedWork(db, { lastOkAt: original, createdAt: original, retentionDeadline: originalDeadline });
+  await approve(service);
+  assert.equal(JSON.parse((await service.publication()).libraryJson).movies.length, 1);
+  assert.equal((await service.deleteEligible({ expectedGeneration: 1 })).removedCount, 0);
+  let metadata = row(db, 'SELECT * FROM api_metadata');
+  assert.equal(metadata.last_ok_at, original);
+  assert.equal(metadata.last_attempt_at, original);
+  assert.equal(metadata.retention_deadline, originalDeadline);
+  assert.equal(row(db, 'SELECT created_at FROM works').created_at, original);
+  await observe(service, 'api_error');
+  metadata = row(db, 'SELECT * FROM api_metadata');
+  assert.equal(metadata.last_ok_at, original);
+  assert.equal(metadata.retention_deadline, originalDeadline);
+  assert.equal(metadata.last_attempt_at, '2026-11-11T00:00:00.000Z');
+  await observe(service, 'ok', { title: 'Refreshed after offset date' });
+  metadata = row(db, 'SELECT * FROM api_metadata');
+  assert.equal(metadata.last_ok_at, '2026-11-11T00:00:00.000Z');
+  assert.equal(metadata.retention_deadline, '2026-12-11T00:00:00.000Z');
+  assert.equal(row(db, 'SELECT created_at FROM works').created_at, original);
+});
+
+test('negative offsets, milliseconds and zero offsets compare as UTC instants and new timestamps use Z', async t => {
+  const { db, service } = setup(t, '2026-11-11T09:03:41.123+09:00');
+  seedWork(db, { lastOkAt: '2026-11-10T19:03:41.123-05:00',
+    createdAt: '2026-11-10T19:03:41.123-05:00', retentionDeadline: '2026-12-11T00:03:41.123+00:00' });
+  await approve(service);
+  assert.equal(JSON.parse((await service.publication()).libraryJson).movies.length, 1);
+  await observe(service, 'ok', { title: 'Same instant refresh' });
+  assert.equal(row(db, 'SELECT last_ok_at FROM api_metadata').last_ok_at, '2026-11-11T00:03:41.123Z');
+  assert.equal(row(db, 'SELECT retention_deadline FROM api_metadata').retention_deadline, '2026-12-11T00:03:41.123Z');
+});
+
+test('offset retention deadlines obey the exact UTC deletion boundary', async t => {
+  const { db, service, at } = setup(t, '2026-11-27T23:59:59.999Z');
+  seedWork(db, { lastOkAt: '2026-11-01T09:00:00+09:00',
+    retentionDeadline: '2026-11-30T19:00:00-05:00' });
+  await approve(service);
+  assert.equal((await service.deleteEligible({ expectedGeneration: 1 })).removedCount, 0);
+  at('2026-11-28T00:00:00.000Z');
+  assert.equal((await service.deleteEligible({ expectedGeneration: 1 })).removedCount, 1);
+  assert.equal(row(db, 'SELECT deleted_at FROM deletion_audit').deleted_at, '2026-11-28T00:00:00.000Z');
+});
+
+test('offset missing-observation anchors use elapsed UTC time for the 24-hour rule', async t => {
+  const { db, service, at } = setup(t, '2026-11-12T00:00:00.000Z');
+  seedWork(db);
+  db.sqlite.prepare(`INSERT INTO ccm_metadata_state VALUES ('movie_1',?,?,2)`).run(
+    '2026-11-11T09:00:00+09:00', '2026-11-11T18:59:59.999-05:00');
+  assert.equal((await service.deleteEligible({ expectedGeneration: 0 })).removedCount, 0);
+  await observe(service, 'unavailable');
+  assert.equal(row(db, 'SELECT first_missing_at FROM ccm_metadata_state').first_missing_at, '2026-11-11T09:00:00+09:00');
+  assert.equal(row(db, 'SELECT last_missing_at FROM ccm_metadata_state').last_missing_at, '2026-11-12T00:00:00.000Z');
+  assert.equal((await service.deleteEligible({ expectedGeneration: 1 })).removedCount, 1);
+  at('2026-11-12T09:00:00+09:00');
+  assert.equal((await service.state()).generation, 2);
+});
+
+test('explicit-offset parser rejects invalid calendar/time/offset values and missing timezone', async t => {
+  const { db, service } = setup(t);
+  seedWork(db);
+  const invalid = [
+    '2026-02-30T09:00:00+09:00', '2024-02-30T09:00:00+09:00', '2025-02-29T09:00:00+09:00',
+    '1900-02-29T09:00:00+09:00', '2026-04-31T09:00:00+09:00', '2026-00-01T09:00:00+09:00',
+    '2026-13-01T09:00:00+09:00', '2026-11-00T09:00:00+09:00', '2026-11-32T09:00:00+09:00',
+    '2026-11-01T24:00:00+09:00', '2026-11-01T09:60:00+09:00', '2026-11-01T09:00:60+09:00',
+    '2026-11-01T09:00:00+24:00', '2026-11-01T09:00:00+09:60', '2026-11-01T09:00:00-24:00',
+    '2026-11-01T09:00:00+0900', '2026-11-01T09:00:00+9:00', '2026-11-01T09:00:00',
+    '2026-11-01T09:00:00.1+09:00', '2026-11-01T09:00:00.12+09:00', '2026-11-01T09:00:00.1234+09:00',
+    '2026-11-01 09:00:00+09:00', '2026-11-01T09:00:00z',
+  ];
+  for (const value of invalid) {
+    db.sqlite.prepare('UPDATE api_metadata SET last_ok_at=?').run(value);
+    await assert.rejects(approve(service), { code: 'invalid_metadata_time' }, value);
+    assert.equal((await service.state()).initialized, false);
+  }
+});
+
+test('valid Gregorian leap dates with explicit offsets remain accepted', async t => {
+  const { db, service } = setup(t, '2024-03-01T00:00:00.000Z');
+  seedWork(db, { lastOkAt: '2024-02-29T09:00:00+09:00', createdAt: '2024-02-29T09:00:00+09:00',
+    retentionDeadline: '2024-03-30T09:00:00+09:00' });
+  await approve(service);
+  assert.equal(JSON.parse((await service.publication()).libraryJson).movies.length, 1);
+  assert.equal(row(db, 'SELECT last_ok_at FROM api_metadata').last_ok_at, '2024-02-29T09:00:00+09:00');
+});

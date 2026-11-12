@@ -56,6 +56,25 @@ const projection = generation => ({expectedGeneration: generation,
   movies: [{id: 'movie_1', genre: '映画', titleMode: 'api'}, {id: 'movie_2', genre: '短編', titleMode: 'manual', manualTitle: '承認した上映名'}],
   queue: [{id: 'queue_1', movieId: 'movie_1'}, {id: 'queue_2', movieId: 'movie_1'}, {id: 'queue_3', movieId: 'movie_2'}]});
 
+test('real local D1: existing JST timestamps support approval and refresh without rewriting historical dates', async t => {
+  const {db, call} = await setup(t);
+  const jst = days => new Date(Date.now() + days * 86400000 + 9 * 3600000).toISOString().replace('Z', '+09:00');
+  const original = jst(-1);
+  await db.prepare('UPDATE works SET created_at=?,updated_at=?').bind(original, original).run();
+  await db.prepare('UPDATE api_metadata SET last_ok_at=?,last_attempt_at=?,retention_deadline=?')
+    .bind(original, original, jst(29)).run();
+  let result = await call('/v1/approvals', projection(0));
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal((await call('/v1/publication', undefined, DEPLOY)).status, 200);
+  assert.equal((await call('/v1/deployments/begin', {attemptId: '109-1', expectedRevision: 1}, DEPLOY)).status, 200);
+  assert.equal((await call('/v1/deployments/109-1/authorize', {}, DEPLOY)).status, 200);
+  result = await call('/v1/metadata/refresh', {workIds: ['movie_1']});
+  assert.equal(result.status, 200, JSON.stringify(result.body));
+  assert.equal(result.body.refresh.ok, 1);
+  assert.equal((await db.prepare("SELECT created_at FROM works WHERE id='movie_1'").first()).created_at, original);
+  assert.match((await db.prepare("SELECT last_ok_at FROM api_metadata WHERE work_id='movie_1'").first()).last_ok_at, /Z$/);
+});
+
 test('real local D1: approval, metadata, revision fencing, callback and deletion remain coherent', async t => {
   const {db, call, mode} = await setup(t);
   assert.equal((await call('/v1/state', undefined, 'wrong')).status, 401);

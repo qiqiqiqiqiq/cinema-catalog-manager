@@ -23,11 +23,20 @@ function string(value, max = 500) {
 }
 function validId(value) { return typeof value === 'string' && ID.test(value); }
 function parseUtc(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{3})?Z$/.test(value)) return null;
+  if (typeof value !== 'string') return null;
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{3}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+  if (!parts) return null;
+  const year = Number(parts[1]), month = Number(parts[2]), day = Number(parts[3]);
+  const hour = Number(parts[4]), minute = Number(parts[5]), second = Number(parts[6]);
+  const offsetHour = Number(parts[10] ?? 0), offsetMinute = Number(parts[11] ?? 0);
+  // Validate the stated calendar date before applying its offset. Date.parse()
+  // alone normalizes impossible dates such as February 30 into the next month.
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] ||
+      hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59) return null;
   const time = Date.parse(value);
-  if (!Number.isFinite(time)) return null;
-  const canonical = new Date(time).toISOString();
-  return value === canonical || value === canonical.replace('.000Z', 'Z') ? time : null;
+  return Number.isFinite(time) ? time : null;
 }
 function sameKeys(value, keys) {
   return value && typeof value === 'object' && !Array.isArray(value) &&
