@@ -15,6 +15,7 @@ import urllib.request
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 CONTEXT_VERSION = 1
+USER_AGENT = "CCM-Publication/0.1 (+https://github.com/qiqiqiqiqiq/cinema-catalog-manager)"
 
 
 class DeployError(Exception):
@@ -60,7 +61,8 @@ class ApiClient:
         request = urllib.request.Request(
             self.base_url + path, data=data, method=method,
             headers={"Authorization": "Bearer " + self.token,
-                     "Content-Type": "application/json", "Accept": "application/json"},
+                     "Content-Type": "application/json", "Accept": "application/json",
+                     "User-Agent": USER_AGENT},
         )
         try:
             with self.opener.open(request, timeout=30) as response:
@@ -79,7 +81,7 @@ class ApiClient:
 
 
 def fetch_public(url):
-    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    request = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
     try:
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=30) as response:
             return read_bounded(response)

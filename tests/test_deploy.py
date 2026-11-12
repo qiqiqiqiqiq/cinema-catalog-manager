@@ -277,6 +277,39 @@ class DeploymentTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_api_request_identifies_ccm_and_keeps_bearer_authentication(self):
+        captured = {}
+        class Opener:
+            def open(self, request, timeout):
+                captured.update(request=request, timeout=timeout)
+                return io.BytesIO(b'{"revision":7}')
+        client = deploy.ApiClient("https://example.invalid", "synthetic-token", Opener())
+        result = client.request("GET", "/v1/state")
+        request = captured["request"]
+        self.assertEqual(request.get_header("User-agent"),
+                         "CCM-Publication/0.1 (+https://github.com/qiqiqiqiqiq/cinema-catalog-manager)")
+        self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-token")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(captured["timeout"], 30)
+        self.assertEqual(result, {"revision": 7})
+
+    def test_public_fetch_identifies_ccm_without_forwarding_authentication(self):
+        captured = {}
+        class Opener:
+            def open(self, request, timeout):
+                captured.update(request=request, timeout=timeout)
+                return io.BytesIO(b'{"version":1,"movies":[]}')
+        with patch.object(deploy.urllib.request, "build_opener", return_value=Opener()) as build:
+            result = deploy.fetch_public("https://example.github.io/cinema/library.json")
+        request = captured["request"]
+        self.assertEqual(request.get_header("User-agent"),
+                         "CCM-Publication/0.1 (+https://github.com/qiqiqiqiqiq/cinema-catalog-manager)")
+        self.assertIsNone(request.get_header("Authorization"))
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(captured["timeout"], 30)
+        self.assertIsInstance(build.call_args.args[0], deploy.NoRedirect)
+        self.assertEqual(result, b'{"version":1,"movies":[]}')
+
     def test_allowlist_referential_integrity_and_duplicate_keys(self):
         bad_publications = []
         duplicate_movie = publication()
