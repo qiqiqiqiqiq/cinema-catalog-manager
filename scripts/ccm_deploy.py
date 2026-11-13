@@ -2,10 +2,12 @@
 """Authenticated CCM publication lifecycle. Never print API bodies or secrets."""
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -15,6 +17,8 @@ import urllib.request
 
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 CONTEXT_VERSION = 1
+PUBLIC_DIRECTORY = "public-artifact"
+PUBLIC_FILES = {"library.json", "queue.json"}
 USER_AGENT = "CCM-Publication/0.1 (+https://github.com/qiqiqiqiqiq/cinema-catalog-manager)"
 
 
@@ -159,6 +163,7 @@ class DeploymentRunner:
     def __init__(self, env=None, cwd=None, api=None, public_fetch=None, sleep=None):
         self.env = dict(os.environ if env is None else env)
         self.cwd = Path.cwd().resolve() if cwd is None else Path(cwd).resolve()
+        self.public_dir = self.cwd / PUBLIC_DIRECTORY
         run_id = self.env.get("GITHUB_RUN_ID", "")
         run_attempt = self.env.get("GITHUB_RUN_ATTEMPT", "")
         if not re.fullmatch(r"[0-9]{1,24}", run_id) or not re.fullmatch(r"[0-9]{1,12}", run_attempt):
@@ -217,6 +222,11 @@ class DeploymentRunner:
     def prepare(self):
         if self.context_path.exists():
             raise DeployError("attempt_context_exists")
+        # Refuse stale output rather than sweeping arbitrary workspace files.
+        # A fresh GitHub checkout has no generated directory; a local rerun must
+        # explicitly remove its own old output before starting a new attempt.
+        if self.public_dir.exists() or self.public_dir.is_symlink():
+            raise DeployError("artifact_directory_exists")
         requested = self.env.get("REQUESTED_REVISION", "").strip()
         if requested and not re.fullmatch(r"[1-9][0-9]{0,15}", requested):
             raise DeployError("invalid_requested_revision")
@@ -237,8 +247,12 @@ class DeploymentRunner:
             raise DeployError("invalid_begin_response")
         context["began"] = True
         self.save(context)
-        (self.cwd / "library.json").write_bytes(library_bytes)
-        (self.cwd / "queue.json").write_bytes(queue_bytes)
+        self.public_dir.mkdir(mode=0o700)
+        (self.public_dir / "library.json").write_bytes(library_bytes)
+        (self.public_dir / "queue.json").write_bytes(queue_bytes)
+        context["artifactHashes"] = [hashlib.sha256(data).hexdigest() for data in (library_bytes, queue_bytes)]
+        self.save(context)
+        self.check_artifact()
         context["phase"] = "prepared"
         self.save(context)
         output = self.env.get("GITHUB_OUTPUT")
@@ -247,10 +261,27 @@ class DeploymentRunner:
                 stream.write("revision=" + str(revision) + "\n")
         print("publication_prepared revision=" + str(revision))
 
+    def check_artifact(self):
+        if (self.public_dir.is_symlink() or not self.public_dir.is_dir()
+                or self.public_dir.resolve() != self.public_dir):
+            raise DeployError("invalid_artifact_directory")
+        entries = list(self.public_dir.iterdir())
+        if {item.name for item in entries} != PUBLIC_FILES:
+            raise DeployError("unexpected_artifact_file")
+        for item in entries:
+            info = item.lstat()
+            if (not stat.S_ISREG(info.st_mode) or item.is_symlink() or info.st_nlink != 1):
+                raise DeployError("invalid_artifact_file")
+        contents = tuple((self.public_dir / name).read_bytes() for name in ("library.json", "queue.json"))
+        if [hashlib.sha256(data).hexdigest() for data in contents] != self.load().get("artifactHashes"):
+            raise DeployError("artifact_content_changed")
+        return contents
+
     def authorize(self):
         context = self.load()
         if not context.get("began") or context.get("finishPayload"):
             raise DeployError("attempt_not_active")
+        self.check_artifact()
         context["phase"] = "authorize"
         self.save(context)
         result = self.call(context, "POST", "/v1/deployments/" + self.attempt_id + "/authorize", {})
@@ -267,7 +298,7 @@ class DeploymentRunner:
         if not context.get("authorized") or context.get("finishPayload"):
             raise DeployError("attempt_not_authorized")
         base_url = safe_url(self.env.get("PAGE_URL", ""))
-        expected = ((self.cwd / "library.json").read_bytes(), (self.cwd / "queue.json").read_bytes())
+        expected = self.check_artifact()
         for index, delay in enumerate(delays):
             self.sleep(delay)
             context.update(phase="verify", retryCount=index, libraryMatches=False, queueMatches=False)
@@ -348,11 +379,11 @@ class DeploymentRunner:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "authorize", "verify", "finish"))
+    parser.add_argument("command", choices=("prepare", "check-artifact", "authorize", "verify", "finish"))
     args = parser.parse_args(argv)
     try:
         runner = DeploymentRunner()
-        getattr(runner, args.command)()
+        getattr(runner, args.command.replace("-", "_"))()
         return 0
     except DeployError as exc:
         print("CCM deployment error: " + exc.code, file=sys.stderr)

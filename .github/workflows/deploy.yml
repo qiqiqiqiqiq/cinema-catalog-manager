@@ -7,9 +7,19 @@ on:
         description: "Expected approved publication revision (blank: latest)"
         required: false
         type: string
+  workflow_call:
+    inputs:
+      revision:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CCM_DEPLOY_TOKEN:
+        required: true
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -20,7 +30,7 @@ concurrency:
 jobs:
   deploy:
     # An unmerged branch/PR must not gain a publication path through dispatch.
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment:
@@ -33,21 +43,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Recover an abandoned publisher only after conclusive termination
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ccm_recover.py
+
       - name: Read and validate approved snapshot; record attempt in D1
         id: prepare
         env:
           REQUESTED_REVISION: ${{ inputs.revision }}
         run: python3 scripts/ccm_deploy.py prepare
 
-      # P1: narrow the artifact to a dedicated public directory. Root packaging
-      # deliberately remains unchanged in Stage 1 P0; no context/secrets go here.
+      - name: Check public file allowlist and unchanged bytes
+        run: python3 scripts/ccm_deploy.py check-artifact
+
       - name: Upload Pages artifact (retain one day)
         id: artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: .
+          path: public-artifact
           retention-days: 1
-          include-hidden-files: false
 
       - name: Revalidate revision immediately before deployment
         id: authorize

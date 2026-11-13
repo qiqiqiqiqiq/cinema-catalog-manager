@@ -1,4 +1,4 @@
-name: Test Stage 1 P0
+name: Test Stage 1
 on:
   pull_request:
   push:

@@ -1,5 +1,7 @@
 import {createService} from './service.js';
 import {boundedJson, fetchMetadata, reserveApiUnit} from './youtube.js';
+import {createCatalog} from './catalog.js';
+import {createMaintenance} from './maintenance.js';
 
 const MAX_BODY = 262144;
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
@@ -35,11 +37,15 @@ async function role(request, env) {
   const admin = env.CCM_ADMIN_TOKEN, deploy = env.CCM_DEPLOY_TOKEN;
   if (typeof admin !== 'string' || admin.length < 32 || typeof deploy !== 'string'
       || deploy.length < 32 || admin === deploy) fail(503, 'configuration_error');
+  const maintenance = env.CCM_MAINTENANCE_TOKEN;
+  if (maintenance !== undefined && (typeof maintenance !== 'string' || maintenance.length < 32 ||
+      maintenance === admin || maintenance === deploy)) fail(503, 'configuration_error');
   const auth = request.headers.get('Authorization') || '';
   if (!auth.startsWith('Bearer ') || auth.length > 1024) fail(401, 'unauthorized');
   const token = auth.slice(7);
   if (await equalToken(token, admin)) return 'admin';
   if (await equalToken(token, deploy)) return 'deploy';
+  if (maintenance && await equalToken(token, maintenance)) return 'maintenance';
   fail(401, 'unauthorized');
 }
 function response(payload, status = 200) {
@@ -79,7 +85,8 @@ function finish(value) {
       || (value.retryCount !== undefined && (!integer(value.retryCount) || value.retryCount > 10))) fail(400, 'invalid_request');
 }
 
-export function createWorker({serviceFactory = createService, fetcher = fetch,
+export function createWorker({serviceFactory = createService, catalogFactory = createCatalog,
+  maintenanceFactory = createMaintenance, fetcher = fetch,
   now = () => new Date().toISOString(), uuid = () => crypto.randomUUID(), reserve = reserveApiUnit} = {}) {
   return {async fetch(request, env) {
     try {
@@ -89,17 +96,62 @@ export function createWorker({serviceFactory = createService, fetcher = fetch,
       const deletionGraceHours = setting(env.DELETION_GRACE_HOURS, 72, 1, 696);
       if (deletionGraceHours >= retentionDays * 24) fail(503, 'configuration_error');
       const service = serviceFactory(env.DB, {now, uuid, retentionDays, deletionGraceHours});
-      const path = new URL(request.url).pathname;
+      const catalog = catalogFactory(env.DB, {now, uuid, retentionDays, deletionGraceHours});
+      const maintenance = maintenanceFactory(env.DB, {now, retentionDays, deletionGraceHours});
+      const url = new URL(request.url), path = url.pathname;
       if (request.method === 'GET' && path === '/v1/state') return response(await service.state());
-      if (request.method === 'GET' && path === '/v1/publication') return response(await service.publication());
+      if (request.method === 'GET' && path === '/v1/publication') {
+        if (who === 'maintenance') fail(403, 'forbidden');
+        return response(await service.publication());
+      }
+      if (request.method === 'GET') {
+        if (path === '/v1/deployments/active') {
+          if (who !== 'deploy') fail(403, 'forbidden');
+          return response(await service.activeDeployment());
+        }
+        if (['/v1/maintenance/plan','/v1/maintenance/status'].includes(path)) {
+          if (who === 'deploy') fail(403, 'forbidden');
+          return response(await maintenance[path.endsWith('/plan') ? 'plan' : 'status']());
+        }
+        if (path === '/v1/works' || path === '/v1/approved-configuration' || /^\/v1\/works\/[^/]+$/.test(path)) {
+          if (who !== 'admin') fail(403, 'forbidden');
+          if (path === '/v1/approved-configuration') return response(await catalog.approved());
+          if (path !== '/v1/works') return response(await catalog.detail(path.split('/')[3]));
+          if ([...url.searchParams.keys()].some(k => !['limit','after','status'].includes(k)) ||
+            [...url.searchParams.keys()].some(k => url.searchParams.getAll(k).length !== 1)) fail(400, 'invalid_request');
+          return response(await catalog.list({...(url.searchParams.has('limit') ? {limit: Number(url.searchParams.get('limit'))} : {}),
+            ...(url.searchParams.has('after') ? {after: url.searchParams.get('after')} : {}),
+            ...(url.searchParams.has('status') ? {status: url.searchParams.get('status')} : {})}));
+        }
+      }
       if (request.method !== 'POST') fail(404, 'not_found');
-      const adminRoute = ['/v1/approvals', '/v1/metadata/refresh', '/v1/maintenance/delete-eligible'].includes(path);
-      const deploymentRoute = path === '/v1/deployments/begin' || /^\/v1\/deployments\/[^/]+\/(authorize|finish)$/.test(path);
-      if (!adminRoute && !deploymentRoute) fail(404, 'not_found');
+      const adminRoute = ['/v1/approvals', '/v1/discoveries'].includes(path) || /^\/v1\/works\/[^/]+\/review$/.test(path);
+      const maintenanceRoute = ['/v1/metadata/refresh', '/v1/maintenance/delete-eligible','/v1/maintenance/runs/start'].includes(path) || /^\/v1\/maintenance\/runs\/[^/]+\/finish$/.test(path);
+      const deploymentRoute = path === '/v1/deployments/begin' || /^\/v1\/deployments\/[^/]+\/(authorize|finish|recover)$/.test(path);
+      if (!adminRoute && !deploymentRoute && !maintenanceRoute) fail(404, 'not_found');
       if (adminRoute && who !== 'admin') fail(403, 'forbidden');
+      if (maintenanceRoute && who === 'deploy') fail(403, 'forbidden');
       // Separate deployment credentials prevent normal administration from claiming a Pages verification.
       if (deploymentRoute && who !== 'deploy') fail(403, 'forbidden');
       const value = await body(request);
+      if (path === '/v1/discoveries') {
+        keys(value, ['expectedGeneration','videoUrl','source'], ['expectedGeneration','videoUrl']);
+        return response(await catalog.discover(value));
+      }
+      const review = /^\/v1\/works\/([^/]+)\/review$/.exec(path);
+      if (review) {
+        keys(value, ['expectedGeneration','status','reviewMemo','genreId'], ['expectedGeneration','status']);
+        return response(await catalog.review(review[1], value));
+      }
+      if (path === '/v1/maintenance/runs/start') {
+        keys(value, ['runId'], ['runId']);
+        return response(await maintenance.start(value));
+      }
+      const runFinish = /^\/v1\/maintenance\/runs\/([^/]+)\/finish$/.exec(path);
+      if (runFinish) {
+        keys(value, ['outcome','errorCode','counts'], ['outcome']);
+        return response(await maintenance.finish(runFinish[1], value));
+      }
       if (path === '/v1/approvals') {
         approval(value);
         return response(await service.approve(value));
@@ -130,8 +182,12 @@ export function createWorker({serviceFactory = createService, fetcher = fetch,
         if (!id(value.attemptId) || !integer(value.expectedRevision)) fail(400, 'invalid_request');
         return response(await service.beginDeployment(value));
       }
-      const match = /^\/v1\/deployments\/([^/]+)\/(authorize|finish)$/.exec(path);
+      const match = /^\/v1\/deployments\/([^/]+)\/(authorize|finish|recover)$/.exec(path);
       if (!match || !id(match[1])) fail(400, 'invalid_request');
+      if (match[2] === 'recover') {
+        keys(value, ['runId','runAttempt','runConclusion','pagesConclusion'], ['runId','runAttempt','runConclusion','pagesConclusion']);
+        return response(await service.recoverDeployment(match[1], value));
+      }
       if (match[2] === 'authorize') {
         keys(value, []);
         return response(await service.authorizeDeployment(match[1]));
