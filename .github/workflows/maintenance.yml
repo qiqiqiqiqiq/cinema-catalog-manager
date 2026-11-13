@@ -1,0 +1,47 @@
+name: Maintain CCM catalog
+
+on:
+  schedule:
+    # 03:17 / 09:17 / 15:17 / 21:17 JST; each work is refreshed only when due.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ccm-maintenance
+  cancel-in-progress: false
+
+jobs:
+  maintain:
+    # Enable after migration, Worker deployment, and credential registration.
+    if: github.ref == 'refs/heads/main' && vars.CCM_MAINTENANCE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      revision: ${{ steps.maintain.outputs.revision }}
+      needs_deployment: ${{ steps.maintain.outputs.needs_deployment }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refresh due works and apply retention policy
+        id: maintain
+        env:
+          CCM_API_BASE_URL: ${{ vars.CCM_API_BASE_URL }}
+          CCM_MAINTENANCE_TOKEN: ${{ secrets.CCM_MAINTENANCE_TOKEN }}
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: python3 scripts/ccm_maintenance.py
+
+  publish:
+    needs: maintain
+    if: always() && needs.maintain.outputs.needs_deployment == 'true'
+    permissions:
+      contents: read
+      actions: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
+    with:
+      revision: ${{ needs.maintain.outputs.revision }}
+    secrets:
+      CCM_DEPLOY_TOKEN: ${{ secrets.CCM_DEPLOY_TOKEN }}

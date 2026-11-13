@@ -489,6 +489,47 @@ export function createService(db, options = {}) {
       [row.revision, attemptId, attemptId]);
     return { outcome, revision: attempt.revision };
   }
+  async function activeDeployment() {
+    const row = await query(`SELECT a.* FROM ccm_state s JOIN ccm_deployment_attempts a
+      ON a.attempt_id=s.active_attempt_id WHERE s.singleton=1`).first();
+    return {attempt: row ? {attemptId: row.attempt_id, revision: row.revision,
+      authorized: Boolean(row.authorized_at), startedAt: row.started_at, outcome: row.outcome} : null};
+  }
+  async function recoverDeployment(attemptId, input) {
+    assert(input && typeof input.runId === 'string' && /^[0-9]{1,24}$/.test(input.runId) &&
+      Number.isSafeInteger(input.runAttempt) && input.runAttempt > 0 && input.runAttempt < 100000000 &&
+      ['success','failure','cancelled','timed_out','action_required','stale','startup_failure','neutral','skipped'].includes(input.runConclusion) &&
+      ['success','not_started'].includes(input.pagesConclusion));
+    assert(attemptId === `${input.runId}-${input.runAttempt}`, 409, 'recovery_identity_mismatch');
+    const evidence = JSON.stringify({runId: input.runId, runAttempt: input.runAttempt,
+      runConclusion: input.runConclusion, pagesConclusion: input.pagesConclusion});
+    const {state: row, attempt} = await attemptContext(attemptId), {iso} = clock();
+    assert(attempt, 409, 'unknown_attempt');
+    const previous = await query('SELECT evidence_json FROM ccm_deployment_recoveries WHERE attempt_id=?', attemptId).first();
+    if (previous) {
+      assert(previous.evidence_json === evidence, 409, 'recovery_closed');
+      return {recovered: true, attemptId, revision: attempt.revision};
+    }
+    assert(row.active_attempt_id === attemptId && (!attempt.outcome || attempt.outcome === 'uncertain'),
+      409, 'attempt_not_active');
+    assert(input.pagesConclusion !== 'success' || attempt.authorized_at, 409, 'not_authorized');
+    // The deploy credential is a trusted reporter, as it is for /finish. Its
+    // recovery client checks the exact completed GitHub run attempt and Pages
+    // step; elapsed time and a failed/cancelled Pages step are not proof.
+    // Never infer verified from GitHub success: a fresh publish compares bytes.
+    await runMutation({state: row}, [
+      query('INSERT INTO ccm_deployment_recoveries(attempt_id,recovered_at,evidence_json) VALUES (?,?,?)', attemptId, iso, evidence),
+      query(`UPDATE ccm_deployment_attempts SET finished_at=COALESCE(finished_at,?),
+        outcome=COALESCE(outcome,'failed'),error_code=COALESCE(error_code,'result_record_failed') WHERE attempt_id=?`, iso, attemptId),
+      query('UPDATE ccm_state SET active_attempt_id=NULL WHERE singleton=1'),
+      query("UPDATE ccm_publication_requests SET status='failed',updated_at=? WHERE revision=? AND status<>'verified'", iso, attempt.revision),
+      query("UPDATE publication_snapshots SET status='failed' WHERE revision=? AND status<>'verified'", attempt.revision),
+      query("UPDATE deletion_audit SET publication_status='failed' WHERE publication_revision<=? AND publication_status<>'verified'", attempt.revision),
+    ], row.generation, `revision=? AND active_attempt_id=? AND EXISTS
+      (SELECT 1 FROM ccm_deployment_attempts WHERE attempt_id=? AND (outcome IS NULL OR outcome='uncertain'))`,
+    [row.revision, attemptId, attemptId]);
+    return {recovered: true, attemptId, revision: attempt.revision};
+  }
   return { state, approve, publication, refreshPlan, applyMetadata, deleteEligible,
-    beginDeployment, authorizeDeployment, finishDeployment };
+    beginDeployment, authorizeDeployment, finishDeployment, activeDeployment, recoverDeployment };
 }

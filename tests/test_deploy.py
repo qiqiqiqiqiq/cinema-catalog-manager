@@ -81,9 +81,9 @@ class DeploymentTests(unittest.TestCase):
 
     def test_prepare_preserves_utf8_bytes_and_keeps_context_out_of_artifact(self):
         self.runner.prepare()
-        self.assertEqual((self.cwd / "library.json").read_bytes(), self.api.publication["libraryJson"].encode())
-        self.assertEqual((self.cwd / "queue.json").read_bytes(), self.api.publication["queueJson"].encode())
-        self.assertEqual(sorted(path.name for path in self.cwd.iterdir()), ["library.json", "queue.json"])
+        self.assertEqual((self.runner.public_dir / "library.json").read_bytes(), self.api.publication["libraryJson"].encode())
+        self.assertEqual((self.runner.public_dir / "queue.json").read_bytes(), self.api.publication["queueJson"].encode())
+        self.assertEqual(sorted(path.name for path in self.runner.public_dir.iterdir()), ["library.json", "queue.json"])
         private_text = self.runner.context_path.read_text()
         self.assertNotIn("secret-marker", private_text)
         self.assertNotIn("SYNTHETIC01", private_text)
@@ -95,6 +95,42 @@ class DeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(deploy.DeployError, "context_inside_artifact"):
             self.make_runner()
 
+    def test_artifact_excludes_sources_secrets_and_stale_root_files(self):
+        for name in ('private.env', 'README.md', 'library.json', 'queue.json'):
+            (self.cwd / name).write_text('must stay outside artifact')
+        self.runner.prepare()
+        self.assertEqual(set(p.name for p in self.runner.public_dir.iterdir()), deploy.PUBLIC_FILES)
+        self.assertEqual((self.cwd / 'library.json').read_text(), 'must stay outside artifact')
+        self.assertEqual(self.runner.check_artifact()[0], self.api.publication['libraryJson'].encode())
+
+    def test_stale_artifact_directory_is_rejected_before_acquiring_lock(self):
+        self.runner.public_dir.mkdir()
+        (self.runner.public_dir / 'secret.txt').write_text('private')
+        with self.assertRaisesRegex(deploy.DeployError, 'artifact_directory_exists'):
+            self.runner.prepare()
+        self.assertEqual(self.api.calls, [])
+        self.assertEqual((self.runner.public_dir / 'secret.txt').read_text(), 'private')
+
+    def test_artifact_allowlist_and_changed_bytes_block_authorization(self):
+        self.runner.prepare()
+        intruder = self.runner.public_dir / 'source.js'
+        intruder.write_text('not public')
+        with self.assertRaisesRegex(deploy.DeployError, 'unexpected_artifact_file'):
+            self.runner.authorize()
+        intruder.unlink()
+        (self.runner.public_dir / 'queue.json').write_text('{"version":1,"queue":[]}')
+        with self.assertRaisesRegex(deploy.DeployError, 'artifact_content_changed'):
+            self.runner.authorize()
+        self.assertFalse(any(path.endswith('/authorize') for _, path, _ in self.api.calls))
+
+    def test_hard_link_in_artifact_blocks_upload(self):
+        self.runner.prepare()
+        original = self.runner.public_dir / 'library.json'
+        link = self.cwd / 'linked.json'
+        link.hardlink_to(original)
+        with self.assertRaisesRegex(deploy.DeployError, 'invalid_artifact_file'):
+            self.runner.check_artifact()
+
     def test_old_requested_revision_never_acquires_lock(self):
         self.env["REQUESTED_REVISION"] = "6"
         runner = self.make_runner()
@@ -102,7 +138,7 @@ class DeploymentTests(unittest.TestCase):
             runner.prepare()
         self.assertEqual(len(self.api.calls), 1)
         self.assertFalse(runner.context_path.exists())
-        self.assertFalse((self.cwd / "library.json").exists())
+        self.assertFalse((self.runner.public_dir / "library.json").exists())
 
     def test_requested_revision_is_data_not_shell_or_sql(self):
         self.env["REQUESTED_REVISION"] = "$(echo secret)"
@@ -238,6 +274,9 @@ class DeploymentTests(unittest.TestCase):
                 self.runner.finish()
                 self.assertEqual(self.finish_body()["outcome"], "uncertain")
                 self.runner.context_path.unlink()
+                for file in self.runner.public_dir.iterdir():
+                    file.unlink()
+                self.runner.public_dir.rmdir()
 
     def test_artifact_failure_is_recorded_without_deploy(self):
         self.runner.prepare()

@@ -6,6 +6,7 @@ node_modules/
 wrangler.local.jsonc
 library.json
 queue.json
+public-artifact/
 *.sqlite*
 *.db
 __pycache__/

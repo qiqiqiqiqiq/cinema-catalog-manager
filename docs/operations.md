@@ -1,94 +1,74 @@
 # 運用と失敗時の確認
 
-## 公開を進める
+## 定期保守
 
-1. 管理者の承認、API更新、削除条件の適用をWorker経由で行う。
-2. `GET /v1/state` の `needsDeployment` と現在の `revision` を確認する。
-3. `main` の新Pages workflowを起動する。
-4. 対象版の試行開始、Artifact生成、公開直前の認可、Pages配信、公開URLの両JSON照合、結果保存を確認する。
-5. `verifiedRevision` が現在の `revision` に追いつき、`needsDeployment: false` であることを確認する。
+`Maintain CCM catalog`（`maintenance.yml`）は `main` で6時間ごと、毎日03:17・09:17・15:17・21:17 JSTに起動予定です。`CCM_MAINTENANCE_ENABLED` が文字列 `true` のときだけ実行します。手動起動にも同じ条件が適用されます。
 
-公開JSONが変化しないAPI更新では、新しい公開版を発行しない場合があります。`generation` の増加だけをPages再デプロイの根拠にしません。
+1. D1に実行IDを記録し、期限の近い対象から最大50作品ずつ再取得する。
+2. 通常は最終正常取得から13日後を目安に対象とする。新規・取得失敗・取得不能は前回試行から24時間以上空ける。未審査・保留・却下・採用のすべてを対象にする。
+3. APIエラーや予算不足があっても、保持期限に基づく削除条件を独立して評価する。
+4. 実行結果をD1へ保存し、公開待ちまたは残った公開ロックがあれば共通の公開workflowを呼ぶ。一部失敗しても、確定済み更新・削除の公開を試みる。
 
-自動更新が使うのは承認済み構成です。たとえば公開済みAを下書きから外しただけで、別作品BのAPIタイトル更新時にAを公開から除外してはいけません。公開中の作品は引き続きAPI鮮度管理の対象です。作品そのものの削除はWorkerの条件判定を通します。
+再取得は1回の実行につき最大100バッチです。各作品の `last_attempt_at` を進捗に使うため、失敗した先頭の作品だけを同じ実行内で繰り返しません。停止後は次回に未処理・期限到来の作品から再開します。APIエラーで正常取得日時や保持期限を延ばしません。
 
-## 監視する状態
+削除条件はP0と同じです。正常API応答による取得不能が24時間以上離れて2回以上確認された場合、または通常30日の保持期限に対し72時間の削除猶予へ到達した場合に、作品・API情報・関連キュー・公開構成を一体で除去します。日数はWorker設定に従います。
 
-| 状態・現象 | 意味 / 対応 |
+## 監視
+
+Muse向け指示は[muse-p1.md](muse-p1.md)を参照してください。
+
+| 確認先・状態 | 判断 |
 |---|---|
-| `initialized: false` | 初回承認が未実施。旧snapshotを自動採用しない |
-| `needsDeployment: true` | 現在の承認済み版の反映が未完了。workflowを実行し、終端結果を確認する |
-| `activeAttemptId` がある | その試行が公開権を保持中。別試行で上書きしない |
-| Pages成功・結果保存失敗 | D1上は未完了。成功と報告しない。元試行の結果保存可否を調べる |
-| Pages stepがtimeout等で終了状態不明 | `uncertain` を記録してロックを維持。外部デプロイが今後公開し得るため、新しい試行を進めない |
-| 片方のJSONだけ一致 | 未検証。キャッシュ・配信・URL・本文を確認し、両方が一致したときだけ成功にする |
-| 対象版が古くなった | `superseded` としてその試行を閉じ、最新版を新しい試行で配信する |
-| `api_error` | 動画の取得不能ではない。認証・クォータ・通信等を調べる。保持期限は別途進む |
+| `GET /v1/maintenance/status` | 最新20件の保守run。`lastRun` の日時・結果・件数を確認する |
+| `status: partial/failed` | 取得・削除・結果記録等の問題を調べる。公開結果とは分けて報告する |
+| `stale: true` | `running` のまま2時間超過。元のActions実行を確認する |
+| 長時間runが追加されない | 予定時刻、GitHub履歴、有効化変数、workflowの有効状態を照合する |
+| `needsDeployment: true` | 現在の公開版の反映が未完了 |
+| `activeAttemptId` あり | その試行が公開権を保持中。強制上書きしない |
+| `verifiedRevision === revision` かつ `needsDeployment: false` | 現在の版の照合結果がD1に記録されている |
 
-本文の検証時もAPIデータをActionsログへ書きません。ログで必要なのは試行ID、リビジョン、段階、件数、一致結果、定義済みエラーコードです。
+保守の `counts` は `batches`, `ok`, `unavailable`, `apiError`, `deleted`, `refreshRequests` です。受信できた応答を集計した値で、通信断直前にD1へ確定した処理まで漏れなく数える監査ではありません。`refreshRequests` は送信試行数であり、YouTube消費量の確定値ではありません。タイトル、API応答本文、認証ヘッダーはログに出しません。
 
-`workers.dev` ではPython標準の `urllib` のUser-AgentがCloudflare側で403になる場合があります。本スクリプトはアプリ名を明示した `CCM-Publication/0.1` を送信します。認証とリダイレクト拒否は維持しています。403だけからトークン不一致と断定せず、このヘッダーを含む通信設定を確認してください。[Cloudflareの公式説明](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/)
+GitHub Actionsは予定実行が遅延・欠落する場合があります。公開リポジトリでは60日間活動がないと定期workflowが無効化されるため、長期運用では稼働確認が必要です。[GitHub公式：schedule](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)
 
-## 強制停止・孤立した公開ロック
+## 人の承認と公開
 
-runnerの強制終了、通信途絶、結果保存失敗では、終了処理が動かずロックが残る場合があります。本P0のロックに自動期限切れはありません。古いrunnerが後から公開を再開する可能性があるため、時間経過だけで新しい試行へ公開権を渡しません。
+URL候補登録と審査は[API契約](api.md)に従います。採否は人が決めます。審査状態やメモだけを変えても、公開構成は変わりません。公開する作品・順番・ジャンル・タイトル方式・キュー全体を別途承認します。
 
-運用担当者はまず、記録された `activeAttemptId` のGitHub実行とPagesデプロイが終了しているか、古い実行が今後公開できない状態かを確認します。実際の配信版が判別できないときに `verified` を作らないでください。必要な根拠が揃うまでは新しいデプロイを止めます。
-
-Pages stepの失敗と、Pages側のデプロイ処理の終了は同じではありません。特にtimeout等で外部状態が不明なら `uncertain` を記録し、ロックを保持します。公開要求を送る前の確定した失敗、または配信完了後の確定した検証失敗とは区別します。
-
-自動復旧、強制ロック解除API、Museによる復旧手順の実証はP1です。DBのロックを直接NULLへ変更したり、試行履歴を消したりして再開する手順は本P0では提供しません。GitHub実行とPages deploymentの終端を実際に確認できた後にだけ、運用担当者が復旧を判断します。正常な終端通知を保存できる場合は、元の試行IDと事実に一致する結果で完了させます。
-
-すでに `uncertain` が保存された試行は終端記録が確定しているため、後から別の `failed` や `verified` を送って解除することはできません。同一通知の再送もロックを維持します。前段の通常の完了通知による復旧は、まだ終端記録が保存されていない試行に限ります。
-
-## 再試行と古い通知
-
-- 同じ実行中試行の開始・認可は、その試行の再送として扱います。
-- 完了通知の再送は完全に同じ終端結果だけが可能です。失敗を後から成功へ書き換えません。
-- 終了した試行のIDを再利用せず、GitHub再実行時の新しい `run_attempt` を使います。
-- 古い試行が新しい公開対象を検証済みにすることはありません。
-- バージョン再確認や認証に失敗したとき、前回取得したデータを根拠に公開を続けません。
-
-## 期限前の対応
-
-メタデータ更新失敗が続いても、正常取得日時や保持期限をエラー時刻へ置換しません。保持期限に対する削除条件は、取得不能確認とは独立して評価されます。
-
-削除処理完了とPages反映完了は別状態です。期限が迫っているのに `needsDeployment` が解消しない場合、公開の保守が失敗している状態として扱います。本P0はサイト全体の非常停止、CDN全地点の即時消去、既存VRChatインスタンスのキュー消去を実装していません。非常時の公開停止手順と復旧の運用設計は別途必要です。
-
-## 旧運用との混在を防ぐ
-
-Muse等が `works`、`api_metadata`、`publication_snapshots` や追加テーブルへ直接書くと、更新世代・公開版・監査・公開要求の一体更新を迂回できます。P0で提供する操作はWorker APIを使用します。その他の管理処理を再接続するときは、同じ競合・公開分離の契約を守るように設計してから再開します。
-
-APIデータを含む古いJSONをGitへ戻してロールバックしません。必要な公開内容を改めてレビューし、現在のデータから新しいリビジョンとして承認します。削除済み作品IDを使った復元APIはありません。
-
-## デプロイスクリプトの構成
-
-`scripts/ccm_deploy.py` をworkflowから次の順で呼びます。
+`Deploy CCM public JSON` を `main` で起動します。任意の `revision` には現在の版を指定します。空欄なら開始時点の最新版が対象です。本文が変わらず `generation` だけ増えた更新では、再公開が不要な場合があります。
 
 ```text
-prepare → Artifactアップロード → authorize → Pages配信 → verify → finish
+旧ロックの確認・復旧 → prepare → check-artifact → Artifactアップロード
+  → authorize → Pages配信 → verify → finish
 ```
 
-各処理は `python3 scripts/ccm_deploy.py <command>` です。
+公開Artifactには `public-artifact/library.json` と `public-artifact/queue.json` だけを含めます。余分なファイル、シンボリックリンク・ハードリンク、作成後に変わった本文を拒否します。試行文脈は `RUNNER_TEMP` に置き、トークンや公開本文を含めません。
 
-| command | 動作 |
+配信後2分・10分・30分を目安に照合します。片方だけ一致しても成功にしません。D1への結果保存が失敗した場合も公開完了とは報告しません。検証間隔は配信時間の保証ではありません。
+
+## 公開ロックの復旧
+
+公開workflowは最初に `scripts/ccm_recover.py` を実行します。ロックが残っている場合、記録された `run_id-run_attempt` に対応するGitHub実行・job・Pages stepを読みます。
+
+| 確認できた事実 | 動作 |
 |---|---|
-| `prepare` | 公開本文と版を取得し、JSON形式・ID・参照を検証して、試行を開始する |
-| `authorize` | Artifactアップロード後に現在の対象版とロックを再確認する |
-| `verify` | Pagesの実URLから両JSONを取得し、生成済み本文と照合する |
-| `finish` | 実際の各step結果をD1へ通知する。保存失敗は非正常終了とする |
+| 対象実行・jobが終了し、Pages stepが `success` | 事前認可と一致する場合に復旧記録を残して解除し、新しい試行で現在の版を配信・照合 |
+| 対象実行・jobが終了し、Pages stepが `skipped` | 公開要求が出ていない根拠を記録し、新しい試行で現在の版を公開 |
+| 実行中、情報不足、対象を特定できない | 停止してロック維持 |
+| Pages stepが `failure`・`cancelled`・`timed_out` 等 | 外部Pages処理の終了を断定せず、ロック維持 |
 
-`verify` は既定で配信後2分・10分・30分を目安に確認します。これは検証間隔であり、反映時間の保証ではありません。
+GitHubの成功だけで `verifiedRevision` を進めません。復旧は新しい公開試行へ進むための手続きです。公開用トークンを持つworkflowを報告元として信頼する点はP0の `finish` と同じです。
 
-| 環境変数 | 登録・設定元 |
-|---|---|
-| `CCM_API_BASE_URL` | Repository Variable |
-| `CCM_DEPLOY_TOKEN` | GitHub Actions Secret |
-| `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `RUNNER_TEMP` | GitHub Actionsが設定 |
-| `REQUESTED_REVISION` | `prepare` 時の任意workflow入力 `revision` |
-| `PAGE_URL` | Pages deploy stepの `page_url` 出力 |
-| `ARTIFACT_OUTCOME`, `DEPLOY_OUTCOME`, `VERIFY_OUTCOME` | workflowの各step結果 |
+不明なケースは元run、Pages状態、公開本文を運用担当者が確認します。DBのロックを直接NULLにする、履歴を消す、推測した根拠で `recover` を呼ぶ操作は行いません。根拠なしの強制解除機能はありません。
 
-試行の文脈は `RUNNER_TEMP/ccm-deploy-<run_id>-<run_attempt>.json` に保存します。トークンや公開JSON本文をこの文脈ファイルに保存しません。公開本文はAPIから返されたUTF-8文字列を使用し、検証した版と別のデータを後から取得して差し替えません。
+同じ終端通知・復旧根拠の再送は可能です。確定済み結果を別の本文へ書き換えたり、終了した試行IDを新しい試行に使ったりしません。古い通知が最新版を検証済みにすることもありません。
 
-Stage 1ではArtifactの `path: .` を維持しています。非hiddenの公開ソースもArtifactに含まれる制約があります。リポジトリへ秘密やローカル設定を追加しないでください。JSONだけの専用ディレクトリへ絞る作業はP1です。
+## 停止・期限超過の対応
+
+定期処理を止める場合は `CCM_MAINTENANCE_ENABLED` を `false` にします。変数変更は実行中の外部処理を停止させないため、実行中runを別途確認します。
+
+期限が迫っても公開待ちが解消しない場合は保守障害として扱います。D1削除とCDN・VRChatを含む全コピーの消去は同義ではありません。非常時のサイト停止は今回の対象外です。
+
+Museを含む通常操作はWorker経由に統一します。旧JSONをGitへ戻したりD1へ直接書き込んだりせず、現在のデータを改めてレビューして新しい公開版を作ります。
+
+`workers.dev` で403が出たときは認証だけでなくUser-Agentも確認します。付属スクリプトは `CCM-Publication/0.1` を使用し、リダイレクトを拒否します。[Cloudflareの公式説明](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-1xxx-errors/error-1010/)
